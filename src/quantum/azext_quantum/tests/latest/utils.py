@@ -55,10 +55,8 @@ def get_test_workspace_provider_sku_list():
     return get_from_os_environment("AZURE_QUANTUM_WORKSPACE_PROVIDER_SKU_LIST", TEST_WORKSPACE_DEFAULT_PROVIDER_SKU_LIST)
 
 
-def get_test_workspace_v2_provider_sku_list():
-    # Returns the Provider/SKU list (in the '-r' command format) for creating a V2
-    # workspace in the current test location, or None if no V2 providers are
-    # configured for that location. The e2e pipeline passes a location-keyed JSON
+def get_test_workspace_v2_providers():
+    # The e2e pipeline passes a location-keyed JSON
     # map via AZURE_QUANTUM_WORKSPACE_V2_PROVIDERS; each provider is paired with the
     # "default" SKU, matching how the pipeline's ARM deployment builds the providers.
     import json
@@ -66,8 +64,12 @@ def get_test_workspace_v2_provider_sku_list():
     try:
         providers_map = json.loads(providers_map_raw)
     except (ValueError, TypeError):
-        return None
-    location_providers = providers_map.get(get_test_workspace_location())
+        return []
+    return providers_map.get(get_test_workspace_location()) or []
+
+
+def get_test_workspace_v2_provider_sku_list():
+    location_providers = get_test_workspace_v2_providers()
     if not location_providers:
         return None
     return ", ".join(f"{provider['id']}/{TEST_WORKSPACE_DEFAULT_V2_PROVIDER_SKU}" for provider in location_providers if provider.get('id'))

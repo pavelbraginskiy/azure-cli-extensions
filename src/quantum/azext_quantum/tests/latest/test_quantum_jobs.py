@@ -15,9 +15,9 @@ from urllib.parse import urlparse, parse_qs
 from azure.cli.testsdk.scenario_tests import AllowLargeResponse, live_only
 from azure.cli.testsdk import ScenarioTest
 from azure.cli.core.azclierror import InvalidArgumentValueError, RequiredArgumentMissingError, AzureInternalError, ResourceNotFoundError as CliResourceNotFoundError
-from azure.core.exceptions import ResourceNotFoundError as AzureResourceNotFoundError
+from azure.core.exceptions import HttpResponseError, ResourceNotFoundError as AzureResourceNotFoundError
 
-from .utils import get_test_resource_group, get_test_workspace, get_test_workspace_location, issue_cmd_with_param_missing, get_test_workspace_storage, get_test_workspace_random_name
+from .utils import get_test_resource_group, get_test_workspace, get_test_workspace_location, issue_cmd_with_param_missing, get_test_workspace_storage, get_test_workspace_random_name, get_test_workspace_v2_providers, TEST_WORKSPACE_DEFAULT_V2_PROVIDER_SKU
 from ...commands import transform_output
 from ...operations.job import (
     list_files,
@@ -467,10 +467,9 @@ class QuantumJobsScenarioTest(ScenarioTest):
         self.assert_contains_standard_sas_params(job["inputDataUri"])
         self.assert_contains_standard_sas_params(job["outputDataUri"])
 
-        # Update the submitted job's name, priority, and tags, then confirm all three changes were applied
-        updated_job = self.cmd(f'az quantum job update -j {results["id"]} --job-name "Updated job name" --job-priority High --job-tags tag1 tag2 -o json').get_output_in_json()
+        # Update the submitted job's name and tags, then confirm both changes were applied
+        updated_job = self.cmd(f'az quantum job update -j {results["id"]} --job-name "Updated job name" --job-tags tag1 tag2 -o json').get_output_in_json()
         self.assertEqual(updated_job["name"], "Updated job name")
-        self.assertEqual(updated_job["priority"], "High")
         self.assertEqual(updated_job["tags"], ["tag1", "tag2"])
 
         # Run a Quil pass-through job on Rigetti
@@ -507,6 +506,97 @@ class QuantumJobsScenarioTest(ScenarioTest):
         self.assertTrue("ionq" not in results)
 
         self.cmd(f'az quantum workspace delete -g {test_resource_group} -w {test_workspace_temp}')
+
+    @live_only()
+    def test_submit_v2(self):
+        test_location = get_test_workspace_location()
+        providers = [provider for provider in get_test_workspace_v2_providers()
+                     if provider.get("id") and provider.get("targets")]
+        if not providers:
+            self.skipTest(f"No V2 providers and targets configured for location '{test_location}' in AZURE_QUANTUM_WORKSPACE_V2_PROVIDERS")
+
+        provider_id = providers[0]["id"]
+        target_id = providers[0]["targets"][0]
+        test_resource_group = get_test_resource_group()
+        test_workspace_temp = get_test_workspace_random_name()
+        test_storage = get_test_workspace_storage()
+        workspace_args = f"-g {test_resource_group} -w {test_workspace_temp}"
+        shots = 10
+        input_path = os.path.join(TEST_DIR, "input_data", "random-bits.ll")
+        job_args = (f'{workspace_args} -t {target_id} --job-input-format qir.v1 '
+                    f'--job-input-file "{input_path}" --job-output-format microsoft.quantum-results.v2 '
+                    f'--entry-point ENTRYPOINT__main --target-capability BasicExecution --shots {shots} -o json')
+        try:
+            self.cmd(f'az quantum workspace create {workspace_args} --workspace-kind V2 --auto-accept '
+                     f'--skip-autoadd -l {test_location} -a {test_storage} '
+                     f'-r "{provider_id}/{TEST_WORKSPACE_DEFAULT_V2_PROVIDER_SKU}"')
+            self.cmd(f'az quantum workspace show {workspace_args}', checks=[
+                self.check("properties.workspaceKind", "V2")
+            ])
+            time.sleep(60)
+
+            submitted_job = self.cmd(f'az quantum job submit {job_args} --job-name "DPv2 submit job" '
+                                     '--job-params priority=Standard').get_output_in_json()
+            job_id = submitted_job["id"]
+            self.assertEqual(submitted_job["providerId"], provider_id)
+            self.assertEqual(submitted_job["target"], target_id)
+            self.assertEqual(submitted_job["priority"], "Standard")
+            for uri_name in ("containerUri", "inputDataUri", "outputDataUri"):
+                self.assert_not_contains_standard_sas_params(submitted_job.get(uri_name))
+
+            job = self.cmd(f'az quantum job show {workspace_args} -j {job_id} -o json').get_output_in_json()
+            self.assertEqual(job["id"], job_id)
+            self.assertEqual(job["priority"], "Standard")
+            self.assert_contains_standard_sas_params(job["containerUri"])
+            self.assert_contains_standard_sas_params(job["inputDataUri"])
+
+            update_command = (f'az quantum job update {workspace_args} -j {job_id} '
+                              '--job-name "Updated DPv2 job" --job-tags tag1 tag2 -o json')
+            expected_priority = "High"
+            try:
+                updated_job = self.cmd(f'{update_command} --job-priority High').get_output_in_json()
+            except HttpResponseError as error:
+                if error.status_code != 409 or getattr(error.error, "code", None) != "UpdateNotAllowed":
+                    raise
+                job = self.cmd(f'az quantum job show {workspace_args} -j {job_id} -o json').get_output_in_json()
+                self.assertNotEqual(job["status"], "Queued")
+                self.assertEqual(job["priority"], "Standard")
+                expected_priority = "Standard"
+                updated_job = self.cmd(update_command).get_output_in_json()
+
+            self.assertEqual(updated_job["name"], "Updated DPv2 job")
+            self.assertEqual(updated_job["priority"], expected_priority)
+            self.assertEqual(updated_job["tags"], ["tag1", "tag2"])
+
+            completed_job = self.cmd(f'az quantum job wait {workspace_args} -j {job_id} -o json').get_output_in_json()
+            self.assertEqual(completed_job["status"], "Completed")
+            self.assert_contains_standard_sas_params(completed_job["outputDataUri"])
+            output = self.cmd(f'az quantum job output {workspace_args} -j {job_id} -o json').get_output_in_json()
+            self.assertEqual(output["DataFormat"], "microsoft.quantum-results.v2")
+            self.assertEqual(output["Results"][0]["TotalCount"], shots)
+
+            output = self.cmd(f'az quantum run {job_args} --job-name "DPv2 run job" '
+                              '--job-params priority=High').get_output_in_json()
+            self.assertEqual(output["DataFormat"], "microsoft.quantum-results.v2")
+            self.assertEqual(output["Results"][0]["TotalCount"], shots)
+
+            jobs = self.cmd(f'az quantum job list {workspace_args} --provider-id {provider_id} -o json').get_output_in_json()
+            self.assertEqual(len(jobs), 2)
+            self.assertTrue(all(job["providerId"] == provider_id for job in jobs))
+            jobs = self.cmd(f'az quantum job list {workspace_args} --target-id {target_id} -o json').get_output_in_json()
+            self.assertEqual(len(jobs), 2)
+            self.assertTrue(all(job["target"] == target_id for job in jobs))
+
+            first_page = self.cmd(f'az quantum job list {workspace_args} --orderby CreationTime --top 1 -o json').get_output_in_json()
+            self.assertEqual(len(first_page), 1)
+            self.assertEqual(first_page[0]["id"], job_id)
+            next_page = self.cmd(f'az quantum job list {workspace_args} --orderby CreationTime --skip 1 --top 1 -o json').get_output_in_json()
+            self.assertEqual(len(next_page), 1)
+            self.assertNotEqual(next_page[0]["id"], job_id)
+            self.assertEqual(next_page[0]["priority"], "High")
+            self.assertEqual(next_page[0]["status"], "Completed")
+        finally:
+            self.cmd(f'az quantum workspace delete {workspace_args}')
 
     @live_only()
     def test_submit_with_disabled_then_enabled_storage_key_access(self):
